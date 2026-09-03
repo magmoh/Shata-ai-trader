@@ -1,0 +1,327 @@
+From: Claude (Lead Builder) <shata-build>
+Subject: [PATCH] SHATA v0.8.3 -> v0.8.4  (ChatGPT CG-4)
+
+Apply on top of v0.8.3:   patch -p1 < v0.8.4_changes.patch
+
+CG-4 was introduced by my own D-2 patch, and you caught it on review before any chaos
+run did. Reproduced with your script verbatim, then fixed.
+
+  before:  supervisor frozen >1.2s inside protected_records()
+           ready=True  gate_open=True  watchdog=None  progress_age=0.050s (bound 0.3s)
+  after:   ready=False gate_open=False
+           watchdog=PROTECTION_SUPERVISOR_STALLED:0.356357s  progress_age=1.219s
+
+Items 1-3: _background_progress_monotonic advanced ONLY by verify_once(), at cycle start
+           and after each record. verify_one() no longer touches the liveness signal.
+Item 5:    64 striped per-record RLocks. Serialises verification of the SAME record
+           without reintroducing the D-2 portfolio-size coupling.
+Items 4/6: two regressions, both verified to FAIL on v0.8.3; full runnable package sent.
+
+RE-ACCEPTANCE EVIDENCE (verify, do not trust):
+  full suite                       95 passed
+  chaos_1000                       1000 / 0
+  restart_chaos_1000               1000 / 0
+  multi_position_chaos_1000        1000 / 0
+  protection_chaos_1000_fast       1000 / 0
+  supervisor_kill_chaos_1000       1000 / 0   detection max 0.298s vs 1.5s budget
+  CG-2 reproducer                  NOT REPRODUCED
+  CG-4 reproducer                  NOT REPRODUCED
+  D-2 latency                      0.052s == one query (coupling did not return)
+  v0.7 attack replay (12)          0/12 succeed
+  no-secrets scan                  clean
+
+Worth naming: three of the last four findings were introduced by the fix for the
+previous one, and CG-4 was caught by review rather than by 5,000 chaos runs, because
+the harnesses do no foreground work during an injected freeze. Chaos coverage is not
+review.
+
+---
+
+diff --git a/src/shata_trader/protection_supervisor.py b/src/shata_trader/protection_supervisor.py
+--- a/src/shata_trader/protection_supervisor.py
++++ b/src/shata_trader/protection_supervisor.py
+@@ -37,6 +37,13 @@
+         self._last_cycle_started_monotonic=None;self._last_cycle_completed_monotonic=None
+         self._last_progress_monotonic=None   # advances after EVERY record, not per cycle
+         self._oldest_age_seconds=None;self._oldest_age_measured_monotonic=None
++        # v0.8.4/CG-4: BACKGROUND progress only. The foreground post-trade path must
++        # never touch this, or continuous submit() traffic masks a frozen supervisor.
++        self._background_progress_monotonic=None
++        # Striped per-record locks: two concurrent verifications of the SAME record
++        # could otherwise race to contradictory conclusions (one writing UNKNOWN).
++        # Striping keeps this O(1) in memory and never needs cleanup.
++        self._record_locks=tuple(threading.RLock() for _ in range(64))
+ 
+     @property
+     def alive(self)->bool:return bool(self._thread and self._thread.is_alive())
+@@ -50,16 +57,29 @@
+         return float('inf') if completed is None else max(0.0,time.monotonic()-completed)
+ 
+     def progress_age_seconds(self)->float:
+-        """Seconds since the verifier last completed ANY unit of work.
++        """Seconds since the BACKGROUND verifier last completed a unit of work.
+ 
+-        This is the liveness signal. A frozen query stops it advancing; a healthy but
+-        slow full-portfolio cycle does not, because each record advances it.
++        This is the supervisor liveness signal, and it is deliberately blind to the
++        foreground post-trade path.
++
++        v0.8.4/CG-4: verify_one() used to advance the same counter, so a steady stream
++        of submits kept the signal fresh while the background thread was frozen inside
++        a single call. Liveness of a supervisor can only be evidenced by that
++        supervisor doing work.
+         """
+         with self._progress_lock:
+-            last=self._last_progress_monotonic
++            last=self._background_progress_monotonic
+             if last is None:last=self._last_cycle_started_monotonic
+         return float('inf') if last is None else max(0.0,time.monotonic()-last)
+ 
++    def _record_lock(self,intent_id):
++        return self._record_locks[hash(str(intent_id))%len(self._record_locks)]
++
++    def _mark_background_progress(self):
++        with self._progress_lock:
++            now=time.monotonic()
++            self._background_progress_monotonic=now;self._last_progress_monotonic=now
++
+     def oldest_verification_age_seconds(self)->float:
+         """Age of the least recently verified protected position, from durable state.
+ 
+@@ -137,22 +157,23 @@
+         with the background cycle is safe: the ledger has its own locking, and a
+         duplicate verification of the same record is idempotent.
+         """
+-        with self._progress_lock:self._last_progress_monotonic=time.monotonic()
++        # No liveness update here: this is the FOREGROUND path (CG-4).
+         try:rec=self.engine.ledger.get(intent_id)
+         except Exception as exc:
+             self._last_error=f'LEDGER_READ:{type(exc).__name__}';self._notify(self._last_error,None)
+             return [(intent_id,self._last_error)]
+         if not rec or rec.get('state') not in (TradeState.PROTECTED.value,TradeState.PARTIALLY_PROTECTED.value):
+             return []
+-        return self._verify_record(rec)
++        with self._record_lock(intent_id):
++            return self._verify_record(rec,mark_progress=False)
+ 
+-    def _verify_record(self,rec):
++    def _verify_record(self,rec,mark_progress=True):
+         intent_id=rec.get('intent_id');violations=[]
+         try:result=self.engine.verify_protected_record(rec)
+         except Exception as exc:
+             result=None;self._last_error=f'VERIFY_EXCEPTION:{type(exc).__name__}'
+         finally:
+-            with self._progress_lock:self._last_progress_monotonic=time.monotonic()
++            if mark_progress:self._mark_background_progress()
+         if result is False:
+             reason='PROTECTION_MISSING_OR_MISMATCH';violations.append((intent_id,reason));self._notify(reason,intent_id)
+         elif result is None and self._verification_age_seconds(rec)>self.max_verification_age_seconds:
+@@ -169,7 +190,7 @@
+         with self._cycle_lock:
+             with self._progress_lock:
+                 self._last_cycle_started_monotonic=time.monotonic()
+-                self._last_progress_monotonic=time.monotonic()
++            self._mark_background_progress()
+             violations=[]
+             try:
+                 try:records=self.engine.ledger.protected_records()
+@@ -179,7 +200,8 @@
+                 # Oldest first: freshness degrades uniformly instead of starving a record.
+                 records=sorted(records,key=self._verification_age_seconds,reverse=True)
+                 for rec in records:
+-                    violations.extend(self._verify_record(rec))
++                    with self._record_lock(rec.get('intent_id')):
++                        violations.extend(self._verify_record(rec))
+                 return violations
+             finally:
+                 now=time.monotonic()
+@@ -187,6 +209,7 @@
+                     started=self._last_cycle_started_monotonic
+                     self._last_cycle_completed_monotonic=now
+                     self._last_progress_monotonic=now
++                    self._background_progress_monotonic=now
+                 if started is not None:self.last_cycle_duration_seconds=max(0.0,now-started)
+                 oldest=self.oldest_verification_age_seconds()
+                 with self._progress_lock:
+diff --git a/docs/PHASE0_v0.8_CHANGES.md b/docs/PHASE0_v0.8_CHANGES.md
+--- a/docs/PHASE0_v0.8_CHANGES.md
++++ b/docs/PHASE0_v0.8_CHANGES.md
+@@ -381,3 +381,92 @@
+ | no-secrets / no-live-authority | clean |
+ 
+ BUILDER-WRITTEN tests, lower evidentiary weight. Independent regressions still owed.
++
++---
++
++# v0.8.4 — response to ChatGPT CG-4
++
++## CG-4 — foreground traffic masked a frozen background supervisor — **CONFIRMED, FIXED**
++
++**This defect was introduced by my own D-2 patch.** ChatGPT caught it on review of
++v0.8.3 before it ever reached a chaos run.
++
++When `verify_one()` stopped taking `_cycle_lock`, it kept updating
++`_last_progress_monotonic` — the very counter the watchdog reads as the supervisor
++liveness signal. So a steady stream of `submit()` calls kept the signal fresh while the
++background thread was frozen inside a single call. Reproduced with ChatGPT's script,
++run verbatim:
++
++```
++supervisor thread frozen for >1.2s inside protected_records()
++  rt.ready            = True
++  engine.gate_open    = True
++  watchdog last_error = None
++  progress_age        = 0.050s   (bound 0.3s)   <- refreshed by the FOREGROUND path
++```
++
++The v0.8.3 test `test_stall_inside_ledger_read_still_closes_gate` passed only because it
++did no foreground work during the freeze. ChatGPT's exact words: *"the current test does
++not detect this because it waits without running foreground checks."*
++
++### Fix — items 1–5 as specified
++
++1–3. **`_background_progress_monotonic`, advanced only by `verify_once()`** — at cycle
++start and after each record. `progress_age_seconds()` reads it alone and is deliberately
++blind to the foreground path. **Liveness of a supervisor can only be evidenced by that
++supervisor doing work.**
++
++5. **Striped per-record locks.** Removing `_cycle_lock` in D-2 also allowed the
++background cycle and the foreground path to verify the *same* record simultaneously,
++where one side may write `UNKNOWN`. 64 striped `RLock`s serialise per-record
++verification while keeping foreground cost bounded by one query, not by portfolio size
++— O(1) in memory, no cleanup, no reintroduction of the D-2 coupling.
++
++### Verification
++
++```
++CG-4 reproducer, post-fix:
++  rt.ready            = False
++  engine.gate_open    = False
++  watchdog last_error = PROTECTION_SUPERVISOR_STALLED:0.356357s
++  progress_age        = 1.219s   (bound 0.3s)
++
++D-2 still holds:  verify_one() with a 0.60s cycle in flight = 0.052s == one query
++CG-2 still holds: NOT REPRODUCED
++```
++
++### Regressions added (4, 6)
++
++Both verified to **fail on v0.8.3**:
++
++- `test_foreground_traffic_cannot_mask_a_frozen_supervisor` — ChatGPT's script verbatim
++- `test_same_record_is_never_verified_concurrently` — 4 hammering threads against the
++  background cycle, asserting zero overlapping verifications of one record and that the
++  durable state is not knocked to `UNKNOWN`
++
++## Re-acceptance evidence
++
++| gate item | result |
++|---|---|
++| full suite | **95 passed** |
++| `chaos_1000` | 1000 / 0 |
++| `restart_chaos_1000` | 1000 / 0 |
++| `multi_position_chaos_1000` | 1000 / 0 |
++| `protection_chaos_1000_fast` | 1000 / 0 |
++| `supervisor_kill_chaos_1000` | 1000 / 0 · detection max 0.298s, budget 1.5s |
++| CG-2 reproducer | NOT REPRODUCED |
++| CG-4 reproducer | NOT REPRODUCED |
++| D-2 latency | 0.052s == one query |
++| v0.7 attack replay | 0/12 succeed |
++| no-secrets / no-live-authority | clean |
++
++## Note on the pattern
++
++Three of the last four findings (B-6, CG-4, and the earlier gate-open latch) were
++**introduced by the fix for the previous finding**. This is the hardening treadmill named
++in REVIEW_PROTOCOL §11, and it is the strongest argument for the two rules that caught
++them: the builder does not write the proof for his own patch, and every patch that adds
++machinery must answer "what watches this?"
++
++CG-4 in particular was caught by review, not by 5,000 chaos runs — because the harnesses
++did no foreground work during the injected freeze. Chaos coverage is not review.
+diff --git a/tests/test_v082_cg2_and_thread_lifetime.py b/tests/test_v082_cg2_and_thread_lifetime.py
+--- a/tests/test_v082_cg2_and_thread_lifetime.py
++++ b/tests/test_v082_cg2_and_thread_lifetime.py
+@@ -268,5 +268,82 @@
+             rt.stop(release_lease=False)
+ 
+ 
++    # ---- CG-4: foreground traffic must not mask a frozen background supervisor ----
++    def test_foreground_traffic_cannot_mask_a_frozen_supervisor(self):
++        """ChatGPT CG-4, run verbatim. D-2 made verify_one() advance the same liveness
++        counter the watchdog reads, so a steady stream of submits kept the supervisor
++        looking alive while its thread was frozen inside one call."""
++        with tempfile.TemporaryDirectory() as td:
++            b = Path(td); e, ex, rt = build(b, interval=0.02, maxage=0.3)
++            rt.start()
++            intent = IN()
++            rt.submit(intent, PF())
++
++            original = e.ledger.protected_records
++            def freeze_protected_records_for_supervisor_thread():
++                if threading.current_thread().name == 'shata-protection-supervisor':
++                    time.sleep(30)
++                return original()
++            e.ledger.protected_records = freeze_protected_records_for_supervisor_thread
++
++            deadline = time.monotonic() + 1.2
++            while time.monotonic() < deadline:
++                rt.protection_supervisor.verify_one(intent.trade_intent_id)
++                time.sleep(0.05)
++
++            self.assertFalse(rt.ready)
++            self.assertFalse(e.gate_open)
++            self.assertIn('STALLED', rt.safety_watchdog.last_error or '')
++            rt.stop(release_lease=False)
++
++    # ---- CG-4/5: concurrent verification of one record must not race ----
++    def test_same_record_is_never_verified_concurrently(self):
++        """Removing _cycle_lock in D-2 allowed the background cycle and the foreground
++        path to verify the SAME record at once, where one side may write UNKNOWN.
++        Striped per-record locks keep single-record verification serialised while
++        leaving foreground cost bounded by one query, not by portfolio size."""
++        with tempfile.TemporaryDirectory() as td:
++            b = Path(td); e, ex, rt = build(b, interval=0.01, maxage=5.0, ceiling=50.0)
++            rt.start()
++            intent = IN()
++            rt.submit(intent, PF())
++            target = intent.trade_intent_id
++
++            overlap = []
++            inflight = {}
++            guard = threading.Lock()
++            original = e.verify_protected_record
++            def instrumented(rec):
++                rid = rec['intent_id']
++                with guard:
++                    if inflight.get(rid):
++                        overlap.append(rid)
++                    inflight[rid] = True
++                try:
++                    return original(rec)
++                finally:
++                    with guard:
++                        inflight[rid] = False
++            e.verify_protected_record = instrumented
++            ex.latency_seconds = 0.01
++
++            stop = threading.Event()
++            def hammer():
++                while not stop.is_set():
++                    rt.protection_supervisor.verify_one(target)
++            threads = [threading.Thread(target=hammer) for _ in range(4)]
++            for t in threads:
++                t.start()
++            time.sleep(1.0)
++            stop.set()
++            for t in threads:
++                t.join()
++            e.verify_protected_record = original
++
++            self.assertEqual(overlap, [], f'{len(overlap)} concurrent verifications of the same record')
++            self.assertEqual(e.ledger.get(target)['state'], 'PROTECTED')
++            rt.stop(release_lease=False)
++
++
+ if __name__ == '__main__':
+     unittest.main()
